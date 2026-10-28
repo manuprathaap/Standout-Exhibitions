@@ -4,6 +4,9 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
 import multer from 'multer'
+import { neon } from '@neondatabase/serverless'
+import { list as listBlobs } from '@vercel/blob'
+import { handleUpload } from '@vercel/blob/client'
 
 const root = path.dirname(fileURLToPath(import.meta.url))
 const projectRoot = path.resolve(root, '..')
@@ -14,11 +17,21 @@ const secretFile = path.join(dataRoot, 'session-secret')
 const app = express()
 const port = Number(process.env.PORT || 3001)
 const isProduction = process.env.NODE_ENV === 'production'
+const isVercel = Boolean(process.env.VERCEL)
 const loginAttempts = new Map()
 
-fs.mkdirSync(uploadRoot, { recursive: true })
-if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(48), { mode: 0o600 })
-const sessionSecret = fs.readFileSync(secretFile)
+if (!isVercel) {
+  fs.mkdirSync(uploadRoot, { recursive: true })
+  if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(48), { mode: 0o600 })
+}
+if (isVercel && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) {
+  throw new Error('Set SESSION_SECRET to a random value of at least 32 characters in Vercel.')
+}
+const sessionSecret = isVercel ? Buffer.from(process.env.SESSION_SECRET) : fs.readFileSync(secretFile)
+const database = isVercel
+  ? neon(process.env.DATABASE_URL || (() => { throw new Error('Set DATABASE_URL for the Neon database in Vercel.') })())
+  : null
+let databaseReady
 
 const starterData = {
   admin: null,
@@ -90,7 +103,7 @@ const starterData = {
   publishedPortfolio: null,
 }
 
-function readData() {
+function localReadData() {
   try {
     const saved = JSON.parse(fs.readFileSync(dataFile, 'utf8'))
     const data = { ...starterData, ...saved, portfolio: { ...starterData.portfolio, ...saved.portfolio } }
@@ -106,7 +119,42 @@ function readData() {
   }
 }
 
-function writeData(data) {
+async function readData() {
+  if (!isVercel) return localReadData()
+  if (!databaseReady) {
+    databaseReady = database`
+      CREATE TABLE IF NOT EXISTS standout_state (
+        id integer PRIMARY KEY CHECK (id = 1),
+        payload jsonb NOT NULL
+      )
+    `.catch(error => {
+      databaseReady = undefined
+      throw error
+    })
+  }
+  await databaseReady
+  const rows = await database`SELECT payload FROM standout_state WHERE id = 1`
+  if (rows[0]) return rows[0].payload
+  const initial = structuredClone(starterData)
+  initial.publishedPortfolio = structuredClone(initial.portfolio)
+  await database`
+    INSERT INTO standout_state (id, payload)
+    VALUES (1, ${JSON.stringify(initial)}::jsonb)
+    ON CONFLICT (id) DO NOTHING
+  `
+  const initializedRows = await database`SELECT payload FROM standout_state WHERE id = 1`
+  return initializedRows[0].payload
+}
+
+async function writeData(data) {
+  if (isVercel) {
+    await database`
+      INSERT INTO standout_state (id, payload)
+      VALUES (1, ${JSON.stringify(data)}::jsonb)
+      ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload
+    `
+    return
+  }
   const tempFile = `${dataFile}.tmp`
   fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), { mode: 0o600 })
   fs.renameSync(tempFile, dataFile)
@@ -135,9 +183,11 @@ function sessionEmail(req) {
   }
 }
 
-function requireAdmin(req, res, next) {
-  const data = readData()
-  if (!sessionEmail(req) || !data.admin) return res.status(401).json({ error: 'Please sign in to continue.' })
+async function requireAdmin(req, res, next) {
+  const data = await readData()
+  if (!sessionEmail(req) || !data.admin || data.admin.email !== sessionEmail(req)) {
+    return res.status(401).json({ error: 'Please sign in to continue.' })
+  }
   next()
 }
 
@@ -150,11 +200,11 @@ app.use((req, _res, next) => {
   }))
   next()
 })
-app.use('/uploads', express.static(uploadRoot, { index: false, maxAge: '1d' }))
+if (!isVercel) app.use('/uploads', express.static(uploadRoot, { index: false, maxAge: '1d' }))
 app.use('/media', express.static(path.join(projectRoot, 'public', 'media'), { index: false, maxAge: '7d' }))
 
 const upload = multer({
-  storage: multer.diskStorage({
+  storage: isVercel ? multer.memoryStorage() : multer.diskStorage({
     destination: (_req, _file, callback) => callback(null, uploadRoot),
     filename: (_req, file, callback) => {
       const ext = path.extname(file.originalname).toLowerCase()
@@ -171,10 +221,13 @@ const upload = multer({
   },
 })
 
-app.get('/api/setup', (_req, res) => res.json({ needsSetup: !readData().admin }))
+app.get('/api/setup', async (_req, res) => {
+  const data = await readData()
+  res.json({ needsSetup: !data.admin })
+})
 
-app.post('/api/setup', (req, res) => {
-  const data = readData()
+app.post('/api/setup', async (req, res) => {
+  const data = await readData()
   if (data.admin) return res.status(409).json({ error: 'An editor account already exists.' })
   const { email, password } = req.body || {}
   if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address.' })
@@ -182,12 +235,12 @@ app.post('/api/setup', (req, res) => {
   const salt = crypto.randomBytes(16)
   const hash = crypto.scryptSync(password, salt, 64)
   data.admin = { email: email.toLowerCase(), salt: salt.toString('hex'), hash: hash.toString('hex') }
-  writeData(data)
+  await writeData(data)
   res.cookie('standout_session', makeToken(data.admin.email), { httpOnly: true, secure: isProduction, sameSite: 'strict', maxAge: 8 * 60 * 60 * 1000, path: '/' })
   res.json({ email: data.admin.email })
 })
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const key = req.ip
   const attempts = loginAttempts.get(key) || { count: 0, resetAt: Date.now() + 15 * 60 * 1000 }
   if (attempts.resetAt < Date.now()) {
@@ -195,7 +248,7 @@ app.post('/api/auth/login', (req, res) => {
     attempts.resetAt = Date.now() + 15 * 60 * 1000
   }
   if (attempts.count >= 5) return res.status(429).json({ error: 'Too many sign-in attempts. Try again in 15 minutes.' })
-  const data = readData()
+  const data = await readData()
   const { email, password } = req.body || {}
   if (!data.admin) return res.status(409).json({ error: 'Create the editor account first.' })
   const candidate = typeof password === 'string' ? crypto.scryptSync(password, Buffer.from(data.admin.salt, 'hex'), 64) : Buffer.alloc(64)
@@ -216,71 +269,112 @@ app.post('/api/auth/logout', (_req, res) => {
   res.status(204).end()
 })
 
-app.get('/api/auth/session', (req, res) => {
+app.get('/api/auth/session', async (req, res) => {
   const email = sessionEmail(req)
-  const { admin } = readData()
+  const { admin } = await readData()
   res.json(email && admin?.email === email ? { authenticated: true, email } : { authenticated: false })
 })
 
-app.get('/api/admin/portfolio', requireAdmin, (_req, res) => {
-  const data = readData()
+app.get('/api/admin/portfolio', requireAdmin, async (_req, res) => {
+  const data = await readData()
   res.json({ portfolio: data.portfolio })
 })
 
-app.get('/api/admin/media', requireAdmin, (_req, res) => {
-  const uploaded = fs.readdirSync(uploadRoot, { withFileTypes: true })
-    .filter(entry => entry.isFile())
-    .map(entry => ({ name: entry.name, url: `/uploads/${encodeURIComponent(entry.name)}` }))
+app.get('/api/admin/media', requireAdmin, async (_req, res) => {
+  let uploaded
+  if (isVercel) {
+    const blobs = []
+    let cursor
+    do {
+      const result = await listBlobs({ prefix: 'uploads/', cursor })
+      blobs.push(...result.blobs)
+      cursor = result.hasMore ? result.cursor : undefined
+    } while (cursor)
+    uploaded = blobs.map(blob => ({
+      name: path.posix.basename(blob.pathname),
+      url: blob.url,
+    }))
+  } else {
+    uploaded = fs.readdirSync(uploadRoot, { withFileTypes: true })
+      .filter(entry => entry.isFile())
+      .map(entry => ({ name: entry.name, url: `/uploads/${encodeURIComponent(entry.name)}` }))
+  }
   const bundled = fs.readdirSync(path.join(projectRoot, 'public', 'media'), { withFileTypes: true })
     .filter(entry => entry.isFile() && /\.(jpe?g|png|webp|gif|avif)$/i.test(entry.name))
     .map(entry => ({ name: entry.name, url: `/media/${encodeURIComponent(entry.name)}` }))
-  res.json({ media: [...uploaded, ...bundled] })
+  res.json({ media: [...uploaded, ...bundled], uploadMode: isVercel ? 'blob' : 'local' })
 })
 
-app.put('/api/admin/portfolio', requireAdmin, (req, res) => {
+app.get('/api/admin/upload-mode', requireAdmin, (_req, res) => {
+  res.json({ uploadMode: isVercel ? 'blob' : 'local' })
+})
+
+app.put('/api/admin/portfolio', requireAdmin, async (req, res) => {
   const portfolio = req.body?.portfolio
   if (!portfolio || !Array.isArray(portfolio.sections) || !Array.isArray(portfolio.projects) || !Array.isArray(portfolio.services)) {
     return res.status(400).json({ error: 'Portfolio data is incomplete or invalid.' })
   }
-  const data = readData()
+  const data = await readData()
   data.portfolio = { ...data.portfolio, ...portfolio, status: 'draft' }
-  writeData(data)
+  await writeData(data)
   res.json({ portfolio: data.portfolio })
 })
 
-app.post('/api/admin/publish', requireAdmin, (_req, res) => {
-  const data = readData()
+app.post('/api/admin/publish', requireAdmin, async (_req, res) => {
+  const data = await readData()
   if (!data.portfolio.sections.some(section => section.visible && section.type === 'hero')) {
     return res.status(400).json({ error: 'Add a visible hero section before publishing.' })
   }
   data.portfolio.status = 'published'
   data.portfolio.publishedAt = new Date().toISOString()
   data.publishedPortfolio = structuredClone(data.portfolio)
-  writeData(data)
+  await writeData(data)
   res.json({ portfolio: data.portfolio })
 })
 
-app.post('/api/admin/unpublish', requireAdmin, (_req, res) => {
-  const data = readData()
+app.post('/api/admin/unpublish', requireAdmin, async (_req, res) => {
+  const data = await readData()
   data.portfolio.status = 'draft'
   data.publishedPortfolio = null
-  writeData(data)
+  await writeData(data)
   res.json({ portfolio: data.portfolio })
 })
 
-app.post('/api/admin/upload', requireAdmin, (req, res) => {
+app.post('/api/admin/upload-token', requireAdmin, async (req, res, next) => {
+  try {
+    const result = await handleUpload({
+      body: req.body,
+      request: req,
+      onBeforeGenerateToken: async pathname => {
+        if (!/^uploads\/[a-zA-Z0-9._-]+$/.test(pathname)) {
+          throw new Error('Invalid upload path.')
+        }
+        return {
+          allowedContentTypes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'],
+          maximumSizeInBytes: 12 * 1024 * 1024,
+          addRandomSuffix: true,
+        }
+      },
+    })
+    res.json(result)
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/admin/upload', requireAdmin, (req, res, next) => {
   upload.array('images', 12)(req, res, error => {
     if (error) {
-      const status = error instanceof multer.MulterError ? 400 : 400
-      return res.status(status).json({ error: error.message })
+      return res.status(400).json({ error: error.message })
     }
     if (!req.files?.length) return res.status(400).json({ error: 'Choose at least one image to upload.' })
+    if (isVercel) return res.status(400).json({ error: 'Use the direct upload endpoint on Vercel.' })
     res.json({ files: req.files.map(file => ({ name: file.originalname, url: `/uploads/${file.filename}`, size: file.size })) })
   })
 })
 
-app.get('/api/portfolio/:slug', (req, res) => {
-  const { publishedPortfolio: portfolio } = readData()
+app.get('/api/portfolio/:slug', async (req, res) => {
+  const { publishedPortfolio: portfolio } = await readData()
   if (portfolio.status !== 'published' || portfolio.slug !== req.params.slug) {
     return res.status(404).json({ error: 'This portfolio is not available.' })
   }
@@ -295,12 +389,16 @@ app.use('/api', (error, _req, res, _next) => {
   res.status(500).json({ error: 'Something went wrong while processing your request.' })
 })
 
-if (isProduction) {
+if (isProduction && !isVercel) {
   const dist = path.join(projectRoot, 'dist')
   app.use(express.static(dist))
   app.get('*path', (_req, res) => res.sendFile(path.join(dist, 'index.html')))
 }
 
-app.listen(port, () => {
-  console.log(`Standout portfolio server listening on http://localhost:${port}`)
-})
+if (!isVercel) {
+  app.listen(port, () => {
+    console.log(`Standout portfolio server listening on http://localhost:${port}`)
+  })
+}
+
+export default app

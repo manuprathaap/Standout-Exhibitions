@@ -153,12 +153,18 @@ export default function PortfolioPage() {
   const { slug } = useParams()
   const [portfolio, setPortfolio] = useState(null)
   const [state, setState] = useState('loading')
+  const [unavailableMessage, setUnavailableMessage] = useState('')
   const [toast, setToast] = useState('')
   useEffect(() => {
     let active = true
     api.publicPortfolio(slug || 'standout').then(result => {
       if (active) { setPortfolio(result.portfolio); setState('ready') }
-    }).catch(() => { if (active) setState('unavailable') })
+    }).catch(error => {
+      if (active) {
+        setUnavailableMessage(error.message)
+        setState('unavailable')
+      }
+    })
     return () => { active = false }
   }, [slug])
   useEffect(() => {
@@ -170,6 +176,9 @@ export default function PortfolioPage() {
     return () => window.removeEventListener('standout:toast', show)
   }, [])
   if (state === 'loading') return <main className="loading-screen"><Brand /><span>Preparing the portfolio…</span></main>
-  if (state === 'unavailable') return <main className="unavailable-screen"><Brand /><p className="eyebrow">PORTFOLIO UNAVAILABLE</p><h1>This portfolio isn’t published yet.</h1><p>Check the link with the person who shared it with you.</p><Link to="/" className="text-link"><ArrowLeft size={16} /> Return to the home page</Link></main>
+  if (state === 'unavailable') {
+    const notPublished = unavailableMessage === 'This portfolio is not available.'
+    return <main className="unavailable-screen"><Brand /><p className="eyebrow">PORTFOLIO UNAVAILABLE</p><h1>{notPublished ? 'This portfolio isn’t published yet.' : 'We couldn’t load this portfolio.'}</h1><p>{notPublished ? 'Check the link with the person who shared it with you.' : unavailableMessage}</p><Link to="/" className="text-link"><ArrowLeft size={16} /> Return to the home page</Link></main>
+  }
   return <><ViewerContent portfolio={portfolio} />{toast && <div className="toast-message"><Check size={16} /> {toast}</div>}</>
 }

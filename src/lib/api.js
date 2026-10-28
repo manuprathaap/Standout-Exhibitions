@@ -1,3 +1,13 @@
+import { upload as uploadToBlob } from '@vercel/blob/client'
+
+const blobExtensions = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+  'image/avif': '.avif',
+}
+
 async function request(path, options = {}) {
   const response = await fetch(path, {
     credentials: 'include',
@@ -12,7 +22,7 @@ async function request(path, options = {}) {
   try {
     result = await response.json()
   } catch {
-    throw new Error('The server returned an invalid response.')
+    throw new Error(`The server returned an invalid response (${response.status}).`)
   }
   if (!response.ok) throw new Error(result.error || `Request failed (${response.status}).`)
   return result
@@ -30,7 +40,22 @@ export const api = {
   publish: () => request('/api/admin/publish', { method: 'POST' }),
   unpublish: () => request('/api/admin/unpublish', { method: 'POST' }),
   publicPortfolio: slug => request(`/api/portfolio/${encodeURIComponent(slug)}`),
-  upload: files => {
+  upload: async files => {
+    const { uploadMode } = await request('/api/admin/upload-mode')
+    if (uploadMode === 'blob') {
+      const uploaded = await Promise.all(files.map(async file => {
+        const extension = blobExtensions[file.type]
+        if (!extension) throw new Error('Choose a JPEG, PNG, WebP, GIF or AVIF image.')
+        const blob = await uploadToBlob(`uploads/${crypto.randomUUID()}${extension}`, file, {
+          access: 'public',
+          contentType: file.type,
+          handleUploadUrl: '/api/admin/upload-token',
+        })
+        return { name: file.name, url: blob.url, size: file.size }
+      }))
+      return { files: uploaded }
+    }
+
     const body = new FormData()
     files.forEach(file => body.append('images', file))
     return request('/api/admin/upload', { method: 'POST', body })

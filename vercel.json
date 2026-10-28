@@ -1,6 +1,7 @@
 {
   "rewrites": [
-    { "source": "/(.*)", "destination": "/index.html" }
+    { "source": "/admin/:path*", "destination": "/index.html" },
+    { "source": "/portfolio/:path*", "destination": "/index.html" }
   ],
   "functions": {
     "api/**/*.js": {

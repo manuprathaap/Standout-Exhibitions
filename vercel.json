@@ -3,20 +3,9 @@
     { "source": "/admin/:path*", "destination": "/index.html" },
     { "source": "/portfolio/:path*", "destination": "/index.html" }
   ],
-  "builds": [
-    {
-      "src": "api/**/*.js",
-      "use": "@vercel/node",
-      "config": {
-        "includeFiles": "public/media/**"
-      }
-    },
-    {
-      "src": "package.json",
-      "use": "@vercel/static-build",
-      "config": {
-        "distDir": "dist"
-      }
+  "functions": {
+    "api/[...path].js": {
+      "includeFiles": "public/media/**"
     }
-  ]
+  }
 }

@@ -3,7 +3,10 @@
     { "source": "/(.*)", "destination": "/index.html" }
   ],
   "functions": {
-    "api/[...path].js": {
+    "api/**/*.js": {
+      "includeFiles": "public/media/**"
+    },
+    "api/*.js": {
       "includeFiles": "public/media/**"
     }
   }

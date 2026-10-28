@@ -24,12 +24,11 @@ if (!isVercel) {
   fs.mkdirSync(uploadRoot, { recursive: true })
   if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(48), { mode: 0o600 })
 }
-if (isVercel && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) {
-  throw new Error('Set SESSION_SECRET to a random value of at least 32 characters in Vercel.')
-}
-const sessionSecret = isVercel ? Buffer.from(process.env.SESSION_SECRET) : fs.readFileSync(secretFile)
-const database = isVercel
-  ? neon(process.env.DATABASE_URL || (() => { throw new Error('Set DATABASE_URL for the Neon database in Vercel.') })())
+const sessionSecret = isVercel
+  ? Buffer.from(process.env.SESSION_SECRET || '')
+  : fs.readFileSync(secretFile)
+const database = isVercel && process.env.DATABASE_URL
+  ? neon(process.env.DATABASE_URL)
   : null
 let databaseReady
 
@@ -121,6 +120,7 @@ function localReadData() {
 
 async function readData() {
   if (!isVercel) return localReadData()
+  if (!database) throw new Error('DATABASE_URL is not configured for the Vercel API.')
   if (!databaseReady) {
     databaseReady = database`
       CREATE TABLE IF NOT EXISTS standout_state (
@@ -192,6 +192,16 @@ async function requireAdmin(req, res, next) {
 }
 
 app.use(express.json({ limit: '2mb' }))
+app.use('/api', (req, res, next) => {
+  if (!isVercel) return next()
+  const missing = []
+  if (!process.env.DATABASE_URL) missing.push('DATABASE_URL')
+  if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) missing.push('SESSION_SECRET (at least 32 characters)')
+  if (missing.length) {
+    return res.status(503).json({ error: `Vercel environment configuration is incomplete: ${missing.join(', ')}.` })
+  }
+  next()
+})
 app.use((req, _res, next) => {
   const cookie = req.headers.cookie || ''
   req.cookies = Object.fromEntries(cookie.split(';').map(part => part.trim()).filter(Boolean).map(part => {

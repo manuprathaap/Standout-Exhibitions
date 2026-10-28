@@ -3,12 +3,20 @@
     { "source": "/admin/:path*", "destination": "/index.html" },
     { "source": "/portfolio/:path*", "destination": "/index.html" }
   ],
-  "functions": {
-    "api/**/*.js": {
-      "includeFiles": "public/media/**"
+  "builds": [
+    {
+      "src": "api/**/*.js",
+      "use": "@vercel/node",
+      "config": {
+        "includeFiles": "public/media/**"
+      }
     },
-    "api/*.js": {
-      "includeFiles": "public/media/**"
+    {
+      "src": "package.json",
+      "use": "@vercel/static-build",
+      "config": {
+        "distDir": "dist"
+      }
     }
-  }
+  ]
 }
